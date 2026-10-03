@@ -4,6 +4,10 @@ from langchain_core.messages import BaseMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from app.adapters.clinicaltrials import search_clinical_trials
+from app.adapters.openfda import search_openfda
+from app.adapters.pubmed import search_pubmed
+
 
 class PharmaGraphState(TypedDict):
     """State for the pharmaceutical review workflow."""
@@ -16,62 +20,90 @@ class PharmaGraphState(TypedDict):
     grade_decision: Literal["clear", "fallback", "fail"]
     human_approved: bool
     chat_history: List[BaseMessage]
+    pubmed_results: List[Dict]
+    clinical_trials_results: List[Dict]
+    fda_results: List[Dict]
+    normalized_evidence: List[Dict]
+    quality_score: int
 
 
 def literature_search_node(state: PharmaGraphState) -> Dict:
-    """Fetch primary literature or internal known data for the drug."""
+    """Fetch primary evidence from PubMed and normalize it."""
     query = state["drug_query"]
-    print(f"[Node: Literature Search] Fetching clinical data for: {query}")
+    print(f"[Node: Literature Search] Fetching PubMed data for: {query}")
 
-    mock_db = {
-        "Compound-X": [
-            "Abstract: High efficacy in targeting mutated receptors.",
-            "Adverse effect: Mild hepatotoxicity observed at high doses.",
-        ],
-        "Compound-Y": [
-            "Abstract: Inconclusive trials on receptor binding profiles."
-        ],
-        "Drug-Alpha": [
-            "Abstract: Large phase III trial demonstrates strong efficacy and acceptable renal safety."
-        ],
+    pubmed_items = search_pubmed(query)
+    if not pubmed_items:
+        fallback = ["PubMed returned no usable literature for this query."]
+        return {
+            "literature_raw_data": fallback,
+            "pubmed_results": [],
+            "normalized_evidence": [],
+            "quality_score": 0,
+        }
+
+    summaries = [item.summary for item in pubmed_items]
+    normalized = [item.to_dict() for item in pubmed_items]
+
+    return {
+        "literature_raw_data": summaries,
+        "pubmed_results": normalized,
+        "normalized_evidence": normalized,
     }
-
-    data = mock_db.get(query, ["No localized proprietary data found for this exact compound configuration."])
-    return {"literature_raw_data": data}
 
 
 def fact_grader_node(state: PharmaGraphState) -> Dict:
-    """Decide whether the literature is usable or needs fallback."""
+    """Score the usability of the evidence before moving to audit or fallback."""
     data = state["literature_raw_data"]
-    print(f"[Node: Fact Grader] Grading data richness: {data}")
+    evidence = state.get("normalized_evidence", [])
+    print(f"[Node: Fact Grader] Evidence count: {len(data)}")
 
-    if not data:
-        return {"grade_decision": "fail"}
+    if not data or not evidence:
+        return {"grade_decision": "fail", "quality_score": 0}
 
-    first = data[0].lower()
-    if "no localized proprietary data" in first or "inconclusive" in first:
-        return {"grade_decision": "fallback"}
+    score = min(100, len(evidence) * 25)
+    if "no usable literature" in " ".join(data).lower() or score < 25:
+        return {"grade_decision": "fallback", "quality_score": score}
 
-    return {"grade_decision": "clear"}
+    return {"grade_decision": "clear", "quality_score": score}
 
 
 def web_fallback_node(state: PharmaGraphState) -> Dict:
-    """Query external sources when internal data is insufficient."""
+    """Query external safety sources when primary literature is weak."""
     query = state["drug_query"]
-    print(f"[Node: Web Fallback] Triggering external APIs for: {query}")
+    print(f"[Node: Web Fallback] Triggering ClinicalTrials.gov + openFDA for: {query}")
 
-    external_data = [
-        "Web scraping source: Phase I data suggests low affinity but alternative metabolic clearance pathways."
-    ]
-    return {"web_fallback_data": external_data}
+    ct_items = search_clinical_trials(query)
+    fda_items = search_openfda(query)
+
+    ct_data = [item.to_dict() for item in ct_items]
+    fda_data = [item.to_dict() for item in fda_items]
+    combined = [item["summary"] for item in ct_data + fda_data if item.get("summary")]
+
+    return {
+        "web_fallback_data": combined,
+        "clinical_trials_results": ct_data,
+        "fda_results": fda_data,
+        "normalized_evidence": state.get("normalized_evidence", []) + ct_data + fda_data,
+    }
 
 
 def safety_audit_node(state: PharmaGraphState) -> Dict:
-    """Audit safety concerns in both internal and external data."""
-    print("[Node: Safety Audit] Evaluating structural contraindications...")
+    """Audit safety concerns in all normalized evidence sources."""
+    print("[Node: Safety Audit] Evaluating safety signals across sources...")
 
     raw_info = state["literature_raw_data"] + state.get("web_fallback_data", [])
+    evidence = list(state.get("normalized_evidence", []))
     violations = []
+
+    for item in evidence:
+        text = f"{item.get('title', '')} {item.get('summary', '')}".lower()
+        if "hepatotoxicity" in text:
+            violations.append(
+                "CRITICAL WARNING: Detected implicit hepatotoxicity flags at elevated therapeutic intervals."
+            )
+        if "inconclusive" in text or "insufficient evidence" in text:
+            violations.append("WARNING: Trial evidence is inconclusive and may require further confirmation.")
 
     for text in raw_info:
         lowered = text.lower()
@@ -82,16 +114,26 @@ def safety_audit_node(state: PharmaGraphState) -> Dict:
         if "inconclusive" in lowered:
             violations.append("WARNING: Trial evidence is inconclusive and may require further confirmation.")
 
-    return {"safety_violations": violations}
+    unique = []
+    seen = set()
+    for item in violations:
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+
+    return {"safety_violations": unique}
 
 
 def generator_node(state: PharmaGraphState) -> Dict:
-    """Generate the regulatory brief from the collected evidence."""
+    """Generate the final regulatory brief from the collected evidence."""
     print("[Node: Brief Generator] Synthesis of regulatory compliance files underway...")
 
     violations = state.get("safety_violations", [])
+    quality = state.get("quality_score", 0)
     brief = "--- REGULATORY BRIEF FOR COMPOUND ---\n"
     brief += f"Query: {state['drug_query']}\n"
+    brief += f"Evidence Quality Score: {quality}/100\n"
     brief += f"Primary Violations Flagged: {len(violations)}\n"
 
     if violations:
@@ -102,8 +144,8 @@ def generator_node(state: PharmaGraphState) -> Dict:
 
 
 def route_after_grading(state: PharmaGraphState) -> Literal["web_fallback_node", "safety_audit_node"]:
-    """Choose fallback or direct safety review based on data quality."""
-    if state["grade_decision"] == "fallback":
+    """Choose fallback or direct safety review based on evidence quality."""
+    if state.get("grade_decision") == "fallback":
         print("  -> Routing to Web Fallback...")
         return "web_fallback_node"
 
