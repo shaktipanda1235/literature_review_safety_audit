@@ -4,6 +4,11 @@ from langchain_core.messages import BaseMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from app.adapters.pubmed import search_pubmed
+from app.adapters.clinicaltrials import search_clinical_trials
+from app.adapters.openfda import search_openfda
+from app.sources.base import HttpClient
+
 
 class PharmaGraphState(TypedDict):
     """State for the pharmaceutical review workflow."""
@@ -18,26 +23,39 @@ class PharmaGraphState(TypedDict):
     chat_history: List[BaseMessage]
 
 
-def literature_search_node(state: PharmaGraphState) -> Dict:
-    """Fetch primary literature or internal known data for the drug."""
+async def literature_search_node(state: PharmaGraphState) -> Dict:
+    """Fetch primary literature from PubMed, ClinicalTrials.gov, and openFDA."""
     query = state["drug_query"]
     print(f"[Node: Literature Search] Fetching clinical data for: {query}")
 
-    mock_db = {
-        "Compound-X": [
-            "Abstract: High efficacy in targeting mutated receptors.",
-            "Adverse effect: Mild hepatotoxicity observed at high doses.",
-        ],
-        "Compound-Y": [
-            "Abstract: Inconclusive trials on receptor binding profiles."
-        ],
-        "Drug-Alpha": [
-            "Abstract: Large phase III trial demonstrates strong efficacy and acceptable renal safety."
-        ],
-    }
-
-    data = mock_db.get(query, ["No localized proprietary data found for this exact compound configuration."])
-    return {"literature_raw_data": data}
+    # Create shared HTTP client for all adapters
+    client = HttpClient()
+    
+    try:
+        # Query all three sources in parallel
+        pubmed_results = await search_pubmed(query, max_results=5, client=client)
+        ct_results = await search_clinical_trials(query, max_results=5, client=client)
+        fda_results = await search_openfda(query, max_results=5, client=client)
+        
+        # Combine results
+        all_results = pubmed_results + ct_results + fda_results
+        
+        # Format as strings for state (preserving details)
+        data = [
+            f"{item.source}: {item.title} - {item.summary}"
+            for item in all_results
+        ]
+        
+        if not data:
+            data = ["No results found from external sources for: " + query]
+            
+        print(f"  Retrieved {len(data)} items from external sources")
+        return {"literature_raw_data": data}
+    except Exception as e:
+        print(f"  Error querying external sources: {e}")
+        return {"literature_raw_data": [f"Error fetching data: {str(e)}"]}
+    finally:
+        await client.close()
 
 
 def fact_grader_node(state: PharmaGraphState) -> Dict:
