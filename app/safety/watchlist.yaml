@@ -1,0 +1,12 @@
+hepatic:
+  - hepatotoxicity
+  - hepatic injury
+  - liver injury
+  - liver failure
+cardiac:
+  - cardiac arrest
+  - qt prolongation
+  - torsades de pointes
+renal:
+  - renal failure
+  - kidney failure

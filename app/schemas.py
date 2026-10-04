@@ -52,3 +52,14 @@ class GradeResult(BaseModel):
     evidence_level: Literal["none", "weak", "moderate", "strong"]
     sufficient: bool
     missing_topics: List[str] = Field(default_factory=list)
+
+
+class SafetyFinding(BaseModel):
+    """A deterministic safety finding linked to one or more evidence documents."""
+
+    category: str
+    severity: Literal["critical", "high", "moderate", "info", "no_evidence"]
+    summary: str
+    supporting_doc_ids: List[str] = Field(default_factory=list)
+    quote: Optional[str] = None
+    caveat: Optional[str] = None
