@@ -74,6 +74,16 @@ async def test_compiled_graph_runs(monkeypatch):
     monkeypatch.setattr(graph, "search_openfda", source_result("openFDA labels"))
     monkeypatch.setattr(graph, "search_openfda_faers", failed_faers)
 
+    async def fake_safety_audit(state):
+        return {
+            "safety_findings": [],
+            "risk_level": "unknown",
+            "safety_violations": [],
+            "audit_log": state.get("audit_log", []),
+        }
+
+    monkeypatch.setitem(graph.workflow.nodes, "safety_audit_node", fake_safety_audit)
+
     initial_state = {
         "drug_query": "Compound-X",
         "literature_raw_data": [],
