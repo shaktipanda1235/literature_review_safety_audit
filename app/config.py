@@ -5,6 +5,15 @@ PUBMED_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 CLINICALTRIALS_BASE = "https://clinicaltrials.gov/api/v2"
 OPENFDA_BASE = "https://api.fda.gov/drug"
 RXNAV_BASE = "https://rxnav.nlm.nih.gov/REST"
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+WEB_FALLBACK_ALLOWED_DOMAINS = (
+	"fda.gov",
+	"nih.gov",
+	"ema.europa.eu",
+	"who.int",
+	"dailymed.nlm.nih.gov",
+)
+WEB_FALLBACK_MAX_CONTENT_CHARS = 4000
 
 # HTTP settings
 API_TIMEOUT_SECONDS = 30
