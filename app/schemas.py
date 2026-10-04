@@ -63,3 +63,19 @@ class SafetyFinding(BaseModel):
     supporting_doc_ids: List[str] = Field(default_factory=list)
     quote: Optional[str] = None
     caveat: Optional[str] = None
+
+
+class SafetyExtractionCandidate(BaseModel):
+    """A model-proposed finding whose evidence is validated before use."""
+
+    category: str
+    severity: Literal["critical", "high", "moderate", "info"]
+    summary: str
+    supporting_doc_ids: List[str] = Field(min_length=1)
+    quote: str = Field(min_length=1)
+
+
+class SafetyExtractionResult(BaseModel):
+    """Structured output from one category-specific safety extraction call."""
+
+    findings: List[SafetyExtractionCandidate] = Field(default_factory=list)
