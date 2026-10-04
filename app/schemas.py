@@ -3,7 +3,7 @@
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from hashlib import sha256
-from typing import Literal, Optional, List
+from typing import Dict, Literal, Optional, List
 
 from pydantic import BaseModel, Field
 
@@ -79,3 +79,37 @@ class SafetyExtractionResult(BaseModel):
     """Structured output from one category-specific safety extraction call."""
 
     findings: List[SafetyExtractionCandidate] = Field(default_factory=list)
+
+
+NON_MEDICAL_ADVICE_DISCLAIMER = (
+    "For developer practice only. This literature and label summary is not medical advice "
+    "and must not be used for clinical or dosing decisions."
+)
+
+
+class CitedClaim(BaseModel):
+    """A brief statement that must cite one or more retrieved documents."""
+
+    text: str
+    doc_ids: List[str] = Field(default_factory=list)
+
+
+class BriefSource(BaseModel):
+    """Source information for one retrieved evidence document."""
+
+    doc_id: str
+    source: str
+    title: str
+    url: str
+
+
+class Brief(BaseModel):
+    """Structured, citation-validated regulatory evidence summary."""
+
+    summary: Optional[CitedClaim] = None
+    evidence_level: Literal["none", "weak", "moderate", "strong"]
+    key_findings: List[CitedClaim] = Field(default_factory=list)
+    safety_findings_by_severity: Dict[str, List[CitedClaim]] = Field(default_factory=dict)
+    evidence_gaps: List[str] = Field(default_factory=list)
+    sources: List[BriefSource] = Field(default_factory=list)
+    disclaimer: str = NON_MEDICAL_ADVICE_DISCLAIMER

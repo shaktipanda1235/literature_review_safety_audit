@@ -13,9 +13,10 @@ from app.adapters.openfda import search_openfda
 from app.adapters.openfda_faers import search_openfda_faers
 from app.adapters.rxnorm import RxNormClient
 from app.config import GRADE_PARSE_RETRIES, MIN_RELEVANT_DOCUMENTS
+from app.brief import draft_node
 from app.llm import get_llm, load_prompt
 from app.safety.subgraph import safety_audit_node
-from app.schemas import EvidenceItem, GradeResult, SafetyFinding
+from app.schemas import Brief, EvidenceItem, GradeResult, SafetyFinding
 from app.sources.base import HttpClient
 
 
@@ -39,6 +40,7 @@ class PharmaGraphState(TypedDict):
     evidence_level: NotRequired[Literal["none", "weak", "moderate", "strong"]]
     safety_findings: NotRequired[List[SafetyFinding]]
     risk_level: NotRequired[Literal["critical", "high", "moderate", "low", "unknown"]]
+    brief: NotRequired[Brief]
 
 
 async def normalize_node(state: PharmaGraphState) -> Dict:
@@ -238,22 +240,9 @@ def web_fallback_node(state: PharmaGraphState) -> Dict:
     return {"web_fallback_data": external_data}
 
 
-def generator_node(state: PharmaGraphState) -> Dict:
-    """Generate the regulatory brief from the collected evidence."""
-    print("[Node: Brief Generator] Synthesis of regulatory compliance files underway...")
-
-    violations = state.get("safety_violations", [])
-    brief = "--- REGULATORY BRIEF FOR COMPOUND ---\n"
-    brief += f"Query: {state['drug_query']}\n"
-    brief += f"Primary Violations Flagged: {len(violations)}\n"
-    if state.get("risk_level"):
-        brief += f"Overall Risk Level: {state['risk_level']}\n"
-
-    if violations:
-        brief += f"Flags Raised: {violations[0]}\n"
-
-    brief += "Status: Pending Human-in-the-Loop Verification."
-    return {"regulatory_brief": brief}
+async def generator_node(state: PharmaGraphState) -> Dict:
+    """Generate and validate the citation-enforced structured brief."""
+    return await draft_node(state)
 
 
 def route_after_grading(state: PharmaGraphState) -> Literal["web_fallback_node", "safety_audit_node"]:
