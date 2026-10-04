@@ -3,7 +3,9 @@
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from hashlib import sha256
-from typing import Optional, List
+from typing import Literal, Optional, List
+
+from pydantic import BaseModel, Field
 
 
 @dataclass
@@ -33,3 +35,20 @@ class EvidenceItem:
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
         return asdict(self)
+
+
+class DocumentRelevance(BaseModel):
+    """LLM assessment of one retrieved evidence item."""
+
+    doc_id: str
+    relevance: Literal["relevant", "partial", "irrelevant"]
+    rationale: str = ""
+
+
+class GradeResult(BaseModel):
+    """Structured assessment of the relevance and sufficiency of retrieved evidence."""
+
+    document_relevance: List[DocumentRelevance] = Field(default_factory=list)
+    evidence_level: Literal["none", "weak", "moderate", "strong"]
+    sufficient: bool
+    missing_topics: List[str] = Field(default_factory=list)

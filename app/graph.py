@@ -1,7 +1,9 @@
 import asyncio
+import json
+from collections import Counter
 from typing import Dict, List, Literal, NotRequired, TypedDict
 
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
@@ -10,7 +12,9 @@ from app.adapters.clinicaltrials import search_clinical_trials
 from app.adapters.openfda import search_openfda
 from app.adapters.openfda_faers import search_openfda_faers
 from app.adapters.rxnorm import RxNormClient
-from app.schemas import EvidenceItem
+from app.config import GRADE_PARSE_RETRIES, MIN_RELEVANT_DOCUMENTS
+from app.llm import get_llm, load_prompt
+from app.schemas import EvidenceItem, GradeResult
 from app.sources.base import HttpClient
 
 
@@ -30,6 +34,8 @@ class PharmaGraphState(TypedDict):
     normalization_error: NotRequired[str]
     documents: NotRequired[List[EvidenceItem]]
     audit_log: NotRequired[List[str]]
+    grade_result: NotRequired[GradeResult]
+    evidence_level: NotRequired[Literal["none", "weak", "moderate", "strong"]]
 
 
 async def normalize_node(state: PharmaGraphState) -> Dict:
@@ -113,19 +119,109 @@ async def retrieve_node(state: PharmaGraphState) -> Dict:
     }
 
 
-def fact_grader_node(state: PharmaGraphState) -> Dict:
-    """Decide whether the literature is usable or needs fallback."""
-    data = state["literature_raw_data"]
-    print(f"[Node: Fact Grader] Grading data richness: {data}")
+async def grade_node(state: PharmaGraphState) -> Dict:
+    """Grade each document with structured output and a deterministic sufficiency floor."""
+    documents = state.get("documents") or []
+    audit_log = list(state.get("audit_log") or [])
 
-    if not data:
-        return {"grade_decision": "fail"}
+    if not documents:
+        grade_result = GradeResult(
+            document_relevance=[],
+            evidence_level="none",
+            sufficient=False,
+            missing_topics=["No evidence was retrieved."],
+        )
+        return {
+            "grade_result": grade_result,
+            "evidence_level": grade_result.evidence_level,
+            "grade_decision": "fallback",
+            "audit_log": audit_log,
+        }
 
-    first = data[0].lower()
-    if "no localized proprietary data" in first or "inconclusive" in first:
-        return {"grade_decision": "fallback"}
+    document_ids = [str(item.doc_id) for item in documents]
+    grading_input = {
+        "drug": state.get("canonical_name") or state["drug_query"],
+        "documents": [
+            {
+                "doc_id": item.doc_id,
+                "source": item.source,
+                "title": item.title,
+                "text": item.summary[:2000],
+            }
+            for item in documents
+        ],
+    }
+    messages = [
+        SystemMessage(content=load_prompt("fact_grader")),
+        HumanMessage(content=json.dumps(grading_input, ensure_ascii=False)),
+    ]
 
-    return {"grade_decision": "clear"}
+    grade_result = None
+    last_error: Exception | None = None
+    try:
+        structured_grader = get_llm("grader").with_structured_output(GradeResult)
+    except Exception as error:
+        structured_grader = None
+        last_error = error
+
+    if structured_grader is not None:
+        for attempt in range(GRADE_PARSE_RETRIES + 1):
+            try:
+                response = await structured_grader.ainvoke(messages)
+                parsed_result = GradeResult.model_validate(response)
+                received_ids = [item.doc_id for item in parsed_result.document_relevance]
+                if Counter(received_ids) != Counter(document_ids):
+                    raise ValueError("Grader response must include each retrieved doc_id exactly once")
+                grade_result = parsed_result
+                break
+            except Exception as error:
+                last_error = error
+                if attempt < GRADE_PARSE_RETRIES:
+                    messages.append(
+                        HumanMessage(
+                            content=(
+                                "The prior result was invalid. Return a corrected structured result "
+                                "with exactly one relevance assessment for each supplied doc_id."
+                            )
+                        )
+                    )
+
+    if grade_result is None:
+        grade_result = GradeResult(
+            document_relevance=[],
+            evidence_level="none",
+            sufficient=False,
+            missing_topics=["Evidence grading could not be completed reliably."],
+        )
+        error_detail = (
+            f"{type(last_error).__name__}: {last_error}" if last_error else "unknown error"
+        )
+        audit_log.append(f"LLM grading failed after retry: {error_detail}")
+
+    relevant_count = sum(
+        assessment.relevance == "relevant"
+        for assessment in grade_result.document_relevance
+    )
+    sufficient = grade_result.sufficient
+    missing_topics = list(grade_result.missing_topics)
+    if relevant_count < MIN_RELEVANT_DOCUMENTS:
+        sufficient = False
+        floor_topic = (
+            f"At least {MIN_RELEVANT_DOCUMENTS} relevant documents are required; "
+            f"only {relevant_count} were found."
+        )
+        if floor_topic not in missing_topics:
+            missing_topics.append(floor_topic)
+
+    grade_result = grade_result.model_copy(
+        update={"sufficient": sufficient, "missing_topics": missing_topics}
+    )
+    return {
+        "grade_result": grade_result,
+        "evidence_level": grade_result.evidence_level,
+        "grade_decision": "clear" if sufficient else "fallback",
+        "audit_log": audit_log,
+    }
 
 
 def web_fallback_node(state: PharmaGraphState) -> Dict:
@@ -198,7 +294,7 @@ workflow = StateGraph(PharmaGraphState)
 
 workflow.add_node("normalize_node", normalize_node)
 workflow.add_node("retrieve_node", retrieve_node)
-workflow.add_node("fact_grader_node", fact_grader_node)
+workflow.add_node("grade_node", grade_node)
 workflow.add_node("web_fallback_node", web_fallback_node)
 workflow.add_node("safety_audit_node", safety_audit_node)
 workflow.add_node("generator_node", generator_node)
@@ -209,10 +305,10 @@ workflow.add_conditional_edges(
     route_after_normalization,
     {"retrieve_node": "retrieve_node", "END": END},
 )
-workflow.add_edge("retrieve_node", "fact_grader_node")
+workflow.add_edge("retrieve_node", "grade_node")
 
 workflow.add_conditional_edges(
-    "fact_grader_node",
+    "grade_node",
     route_after_grading,
     {
         "web_fallback_node": "web_fallback_node",
