@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from app import graph
@@ -32,6 +34,22 @@ async def test_compiled_graph_runs(monkeypatch):
                 matched_name="metformin",
             )
 
+    class FakeStructuredGrader:
+        def with_structured_output(self, schema):
+            return self
+
+        async def ainvoke(self, messages):
+            payload = json.loads(messages[-1].content)
+            return {
+                "document_relevance": [
+                    {"doc_id": item["doc_id"], "relevance": "relevant"}
+                    for item in payload["documents"]
+                ],
+                "evidence_level": "moderate",
+                "sufficient": True,
+                "missing_topics": [],
+            }
+
     def source_result(source_name):
         async def fetch(*args, **kwargs):
             return [
@@ -50,6 +68,7 @@ async def test_compiled_graph_runs(monkeypatch):
 
     monkeypatch.setattr(graph, "HttpClient", FakeHttpClient)
     monkeypatch.setattr(graph, "RxNormClient", FakeRxNormClient)
+    monkeypatch.setattr(graph, "get_llm", lambda role: FakeStructuredGrader())
     monkeypatch.setattr(graph, "search_pubmed", source_result("PubMed"))
     monkeypatch.setattr(graph, "search_clinical_trials", source_result("ClinicalTrials.gov"))
     monkeypatch.setattr(graph, "search_openfda", source_result("openFDA labels"))
