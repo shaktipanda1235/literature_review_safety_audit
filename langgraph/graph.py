@@ -1,3 +1,5 @@
+import asyncio
+import inspect
 from typing import Any, Callable, Dict, List, Optional
 
 # Lightweight shim of a StateGraph and compile/runtime for local demo/testing.
@@ -33,6 +35,13 @@ class CompiledGraph:
         self.interrupt_before = set(interrupt_before or [])
 
     def invoke(self, initial_state: Dict, config: Optional[Dict] = None) -> Dict:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.ainvoke(initial_state, config=config))
+        raise RuntimeError("invoke() cannot run inside an event loop; use ainvoke() instead")
+
+    async def ainvoke(self, initial_state: Dict, config: Optional[Dict] = None) -> Dict:
         state = dict(initial_state)
         current = None
         # Start from START
@@ -55,6 +64,8 @@ class CompiledGraph:
                 break
 
             updates = node_fn(state)
+            if inspect.isawaitable(updates):
+                updates = await updates
             if isinstance(updates, dict):
                 state.update(updates)
 
