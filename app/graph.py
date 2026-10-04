@@ -1,4 +1,5 @@
-from typing import Dict, List, Literal, TypedDict
+import asyncio
+from typing import Dict, List, Literal, NotRequired, TypedDict
 
 from langchain_core.messages import BaseMessage
 from langgraph.checkpoint.memory import MemorySaver
@@ -7,6 +8,9 @@ from langgraph.graph import END, START, StateGraph
 from app.adapters.pubmed import search_pubmed
 from app.adapters.clinicaltrials import search_clinical_trials
 from app.adapters.openfda import search_openfda
+from app.adapters.openfda_faers import search_openfda_faers
+from app.adapters.rxnorm import RxNormClient
+from app.schemas import EvidenceItem
 from app.sources.base import HttpClient
 
 
@@ -21,41 +25,92 @@ class PharmaGraphState(TypedDict):
     grade_decision: Literal["clear", "fallback", "fail"]
     human_approved: bool
     chat_history: List[BaseMessage]
+    canonical_name: NotRequired[str]
+    synonyms: NotRequired[List[str]]
+    normalization_error: NotRequired[str]
+    documents: NotRequired[List[EvidenceItem]]
+    audit_log: NotRequired[List[str]]
 
 
-async def literature_search_node(state: PharmaGraphState) -> Dict:
-    """Fetch primary literature from PubMed, ClinicalTrials.gov, and openFDA."""
+async def normalize_node(state: PharmaGraphState) -> Dict:
+    """Resolve the submitted name to a canonical RxNorm ingredient."""
     query = state["drug_query"]
-    print(f"[Node: Literature Search] Fetching clinical data for: {query}")
-
-    # Create shared HTTP client for all adapters
-    client = HttpClient()
-    
     try:
-        # Query all three sources in parallel
-        pubmed_results = await search_pubmed(query, max_results=5, client=client)
-        ct_results = await search_clinical_trials(query, max_results=5, client=client)
-        fda_results = await search_openfda(query, max_results=5, client=client)
-        
-        # Combine results
-        all_results = pubmed_results + ct_results + fda_results
-        
-        # Format as strings for state (preserving details)
-        data = [
-            f"{item.source}: {item.title} - {item.summary}"
-            for item in all_results
-        ]
-        
-        if not data:
-            data = ["No results found from external sources for: " + query]
-            
-        print(f"  Retrieved {len(data)} items from external sources")
-        return {"literature_raw_data": data}
-    except Exception as e:
-        print(f"  Error querying external sources: {e}")
-        return {"literature_raw_data": [f"Error fetching data: {str(e)}"]}
+        async with RxNormClient() as client:
+            resolution = await client.resolve(query)
+            error = client.last_error
+    except Exception as exception:
+        resolution = None
+        error = f"RxNorm normalization failed: {exception}"
+
+    if resolution is None:
+        message = error or f"No RxNorm match found for '{query}'."
+        audit_log = list(state.get("audit_log") or [])
+        audit_log.append(f"Normalization failed: {message}")
+        return {"normalization_error": message, "audit_log": audit_log}
+
+    return {
+        "canonical_name": resolution.canonical_name,
+        "synonyms": resolution.synonyms,
+        "normalization_error": "",
+    }
+
+
+def route_after_normalization(
+    state: PharmaGraphState,
+) -> Literal["retrieve_node", "END"]:
+    """Stop the workflow with its normalization error when no concept resolves."""
+    return "END" if state.get("normalization_error") else "retrieve_node"
+
+
+async def retrieve_node(state: PharmaGraphState) -> Dict:
+    """Retrieve evidence concurrently while recording individual source failures."""
+    query = state.get("canonical_name") or state["drug_query"]
+    client = HttpClient()
+    source_names = ["PubMed", "ClinicalTrials.gov", "openFDA labels", "openFDA FAERS"]
+    try:
+        source_results = await asyncio.gather(
+            search_pubmed(query, max_results=5, client=client),
+            search_clinical_trials(query, max_results=5, client=client),
+            search_openfda(query, max_results=5, client=client),
+            search_openfda_faers(query, max_results=20, client=client),
+            return_exceptions=True,
+        )
     finally:
         await client.close()
+
+    documents: List[EvidenceItem] = []
+    audit_log = list(state.get("audit_log") or [])
+    for source_name, result in zip(source_names, source_results):
+        if isinstance(result, asyncio.CancelledError):
+            raise result
+        if isinstance(result, BaseException):
+            audit_log.append(
+                f"{source_name} retrieval failed: {type(result).__name__}: {result}"
+            )
+            continue
+        if not isinstance(result, (list, tuple)):
+            audit_log.append(f"{source_name} retrieval failed: invalid result collection")
+            continue
+
+        valid_documents = [item for item in result if isinstance(item, EvidenceItem)]
+        documents.extend(valid_documents)
+        if len(valid_documents) != len(result):
+            audit_log.append(f"{source_name} returned invalid evidence items")
+
+    literature_raw_data = [
+        f"{item.source}: {item.title} - {item.summary}" for item in documents
+    ]
+    if not literature_raw_data:
+        literature_raw_data = [
+            "No localized proprietary data found for this exact compound configuration."
+        ]
+
+    return {
+        "documents": documents,
+        "literature_raw_data": literature_raw_data,
+        "audit_log": audit_log,
+    }
 
 
 def fact_grader_node(state: PharmaGraphState) -> Dict:
@@ -129,11 +184,11 @@ def route_after_grading(state: PharmaGraphState) -> Literal["web_fallback_node",
     return "safety_audit_node"
 
 
-def route_after_audit(state: PharmaGraphState) -> Literal["generator_node", "literature_search_node", "END"]:
+def route_after_audit(state: PharmaGraphState) -> Literal["generator_node", "retrieve_node", "END"]:
     """Branch after safety review."""
     if state.get("safety_violations"):
         print("  -> Violations detected. Re-routing for review and possible re-draft.")
-        return "literature_search_node"
+        return "retrieve_node"
 
     print("  -> No critical violations found. Generating brief.")
     return "generator_node"
@@ -141,14 +196,20 @@ def route_after_audit(state: PharmaGraphState) -> Literal["generator_node", "lit
 
 workflow = StateGraph(PharmaGraphState)
 
-workflow.add_node("literature_search_node", literature_search_node)
+workflow.add_node("normalize_node", normalize_node)
+workflow.add_node("retrieve_node", retrieve_node)
 workflow.add_node("fact_grader_node", fact_grader_node)
 workflow.add_node("web_fallback_node", web_fallback_node)
 workflow.add_node("safety_audit_node", safety_audit_node)
 workflow.add_node("generator_node", generator_node)
 
-workflow.add_edge(START, "literature_search_node")
-workflow.add_edge("literature_search_node", "fact_grader_node")
+workflow.add_edge(START, "normalize_node")
+workflow.add_conditional_edges(
+    "normalize_node",
+    route_after_normalization,
+    {"retrieve_node": "retrieve_node", "END": END},
+)
+workflow.add_edge("retrieve_node", "fact_grader_node")
 
 workflow.add_conditional_edges(
     "fact_grader_node",
@@ -166,7 +227,7 @@ workflow.add_conditional_edges(
     route_after_audit,
     {
         "generator_node": "generator_node",
-        "literature_search_node": "literature_search_node",
+        "retrieve_node": "retrieve_node",
         "END": END,
     },
 )

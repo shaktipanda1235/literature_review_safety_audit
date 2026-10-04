@@ -1,12 +1,13 @@
 import asyncio
 
+from app.config import DEFAULT_DRUG_QUERY
 from app.graph import PharmaGraphState, compiled_pharma_graph
 
 
 async def main():
     """Run the pharma workflow with async support."""
     initial_state: PharmaGraphState = {
-        "drug_query": "Compound-X",
+        "drug_query": DEFAULT_DRUG_QUERY,
         "literature_raw_data": [],
         "web_fallback_data": [],
         "safety_violations": [],
