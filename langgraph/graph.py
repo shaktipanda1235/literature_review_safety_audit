@@ -18,8 +18,10 @@ class StateGraph:
         self.nodes[name] = func
         self.adj.setdefault(name, [])
 
-    def add_edge(self, src: str, dst: str):
-        self.adj.setdefault(src, []).append(dst)
+    def add_edge(self, src: str | List[str], dst: str):
+        sources = src if isinstance(src, list) else [src]
+        for source in sources:
+            self.adj.setdefault(source, []).append(dst)
 
     def add_conditional_edges(self, name: str, route_fn: Callable, mapping: Dict[str, str]):
         self.conditional[name] = {"route_fn": route_fn, "mapping": mapping}
@@ -49,7 +51,34 @@ class CompiledGraph:
         if not starts:
             return state
 
-        current = starts[0]
+        if len(starts) > 1:
+            async def run_start_node(node_name: str):
+                node_fn = self.graph.nodes.get(node_name)
+                if node_fn is None:
+                    raise KeyError(f"Node '{node_name}' is not registered")
+                updates = node_fn(state)
+                if inspect.isawaitable(updates):
+                    updates = await updates
+                return updates
+
+            branch_updates = await asyncio.gather(
+                *(run_start_node(node_name) for node_name in starts)
+            )
+            for updates in branch_updates:
+                if isinstance(updates, dict):
+                    state.update(updates)
+
+            common_successors = [
+                candidate
+                for candidate in self.graph.adj.get(starts[0], [])
+                if all(
+                    candidate in self.graph.adj.get(node_name, [])
+                    for node_name in starts[1:]
+                )
+            ]
+            current = common_successors[0] if common_successors else None
+        else:
+            current = starts[0]
         max_steps = 200
         steps = 0
 

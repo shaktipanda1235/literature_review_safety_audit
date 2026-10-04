@@ -14,7 +14,8 @@ from app.adapters.openfda_faers import search_openfda_faers
 from app.adapters.rxnorm import RxNormClient
 from app.config import GRADE_PARSE_RETRIES, MIN_RELEVANT_DOCUMENTS
 from app.llm import get_llm, load_prompt
-from app.schemas import EvidenceItem, GradeResult
+from app.safety.subgraph import safety_audit_node
+from app.schemas import EvidenceItem, GradeResult, SafetyFinding
 from app.sources.base import HttpClient
 
 
@@ -36,6 +37,8 @@ class PharmaGraphState(TypedDict):
     audit_log: NotRequired[List[str]]
     grade_result: NotRequired[GradeResult]
     evidence_level: NotRequired[Literal["none", "weak", "moderate", "strong"]]
+    safety_findings: NotRequired[List[SafetyFinding]]
+    risk_level: NotRequired[Literal["critical", "high", "moderate", "low", "unknown"]]
 
 
 async def normalize_node(state: PharmaGraphState) -> Dict:
@@ -235,25 +238,6 @@ def web_fallback_node(state: PharmaGraphState) -> Dict:
     return {"web_fallback_data": external_data}
 
 
-def safety_audit_node(state: PharmaGraphState) -> Dict:
-    """Audit safety concerns in both internal and external data."""
-    print("[Node: Safety Audit] Evaluating structural contraindications...")
-
-    raw_info = state["literature_raw_data"] + state.get("web_fallback_data", [])
-    violations = []
-
-    for text in raw_info:
-        lowered = text.lower()
-        if "hepatotoxicity" in lowered:
-            violations.append(
-                "CRITICAL WARNING: Detected implicit hepatotoxicity flags at elevated therapeutic intervals."
-            )
-        if "inconclusive" in lowered:
-            violations.append("WARNING: Trial evidence is inconclusive and may require further confirmation.")
-
-    return {"safety_violations": violations}
-
-
 def generator_node(state: PharmaGraphState) -> Dict:
     """Generate the regulatory brief from the collected evidence."""
     print("[Node: Brief Generator] Synthesis of regulatory compliance files underway...")
@@ -262,6 +246,8 @@ def generator_node(state: PharmaGraphState) -> Dict:
     brief = "--- REGULATORY BRIEF FOR COMPOUND ---\n"
     brief += f"Query: {state['drug_query']}\n"
     brief += f"Primary Violations Flagged: {len(violations)}\n"
+    if state.get("risk_level"):
+        brief += f"Overall Risk Level: {state['risk_level']}\n"
 
     if violations:
         brief += f"Flags Raised: {violations[0]}\n"
@@ -281,12 +267,7 @@ def route_after_grading(state: PharmaGraphState) -> Literal["web_fallback_node",
 
 
 def route_after_audit(state: PharmaGraphState) -> Literal["generator_node", "retrieve_node", "END"]:
-    """Branch after safety review."""
-    if state.get("safety_violations"):
-        print("  -> Violations detected. Re-routing for review and possible re-draft.")
-        return "retrieve_node"
-
-    print("  -> No critical violations found. Generating brief.")
+    """Generate after one completed deterministic/LLM safety audit pass."""
     return "generator_node"
 
 
