@@ -1,5 +1,7 @@
 """Configuration constants for the pharma LangGraph application."""
 
+import os
+
 # API Base URLs
 PUBMED_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 CLINICALTRIALS_BASE = "https://clinicaltrials.gov/api/v2"
@@ -14,6 +16,12 @@ WEB_FALLBACK_ALLOWED_DOMAINS = (
 	"dailymed.nlm.nih.gov",
 )
 WEB_FALLBACK_MAX_CONTENT_CHARS = 4000
+EMBEDDING_MODEL_NAME = os.getenv(
+	"EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"
+)
+RETRIEVAL_CHUNK_SIZE = 1000
+RETRIEVAL_CHUNK_OVERLAP = 150
+RETRIEVAL_DEFAULT_TOP_K = 5
 
 # HTTP settings
 API_TIMEOUT_SECONDS = 30
