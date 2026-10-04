@@ -4,6 +4,7 @@
 PUBMED_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 CLINICALTRIALS_BASE = "https://clinicaltrials.gov/api/v2"
 OPENFDA_BASE = "https://api.fda.gov/drug"
+RXNAV_BASE = "https://rxnav.nlm.nih.gov/REST"
 
 # HTTP settings
 API_TIMEOUT_SECONDS = 30
