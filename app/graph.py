@@ -6,6 +6,7 @@ from typing import Dict, List, Literal, NotRequired, TypedDict
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
 from app.adapters.pubmed import search_pubmed
 from app.adapters.clinicaltrials import search_clinical_trials
@@ -22,7 +23,14 @@ from app.brief import draft_node
 from app.critic import critic_node
 from app.llm import get_llm, load_prompt
 from app.safety.subgraph import safety_audit_node
-from app.schemas import Brief, EvidenceItem, GradeResult, QueryRewriteResult, SafetyFinding
+from app.schemas import (
+    Brief,
+    EvidenceItem,
+    GradeResult,
+    HumanReviewResponse,
+    QueryRewriteResult,
+    SafetyFinding,
+)
 from app.sources.base import HttpClient
 
 
@@ -53,6 +61,10 @@ class PharmaGraphState(TypedDict):
     critic_passed: NotRequired[bool]
     critic_unresolved: NotRequired[bool]
     redraft_count: NotRequired[int]
+    human_decision: NotRequired[Literal["approve", "edit", "reject"]]
+    human_feedback: NotRequired[str]
+    edited_brief: NotRequired[str]
+    review_status: NotRequired[Literal["pending", "approved", "needs_refinement", "rejected"]]
 
 
 async def normalize_node(state: PharmaGraphState) -> Dict:
@@ -300,6 +312,56 @@ async def generator_node(state: PharmaGraphState) -> Dict:
     return await draft_node(state)
 
 
+def human_review_node(state: PharmaGraphState) -> Dict:
+    """Pause for a human decision after the finished draft and critic review."""
+    response = interrupt(
+        {
+            "question": "Review the generated evidence brief.",
+            "brief": state.get("regulatory_brief", ""),
+            "findings": [
+                finding.model_dump(mode="json")
+                for finding in state.get("safety_findings", [])
+            ],
+            "risk_level": state.get("risk_level", "unknown"),
+            "critic_unresolved": state.get("critic_unresolved", False),
+            "critic_feedback": state.get("critic_feedback", []),
+        }
+    )
+    review = HumanReviewResponse.model_validate(response)
+    audit_log = list(state.get("audit_log") or [])
+    audit_log.append(f"Human review decision: {review.decision}")
+    updates = {
+        "human_decision": review.decision,
+        "human_feedback": review.feedback,
+        "review_status": "pending",
+        "audit_log": audit_log,
+    }
+    if review.edited_brief is not None:
+        updates["edited_brief"] = review.edited_brief
+    return updates
+
+
+def route_after_human_review(
+    state: PharmaGraphState,
+) -> Literal["finalize_node", "refine_node"]:
+    """Route approvals to finalization and edit/reject decisions to refinement."""
+    return "finalize_node" if state.get("human_decision") == "approve" else "refine_node"
+
+
+def finalize_node(state: PharmaGraphState) -> Dict:
+    """Mark the reviewed brief as approved, preserving a human-edited version if supplied."""
+    updates = {"human_approved": True, "review_status": "approved"}
+    if state.get("edited_brief"):
+        updates["regulatory_brief"] = state["edited_brief"]
+    return updates
+
+
+def refine_node(state: PharmaGraphState) -> Dict:
+    """Record a handoff for the bounded refinement workflow implemented in S4.6."""
+    status = "rejected" if state.get("human_decision") == "reject" else "needs_refinement"
+    return {"human_approved": False, "review_status": status}
+
+
 def route_after_grading(
     state: PharmaGraphState,
 ) -> Literal["rewrite_node", "web_fallback_node", "safety_audit_node"]:
@@ -320,10 +382,12 @@ def route_after_audit(state: PharmaGraphState) -> Literal["generator_node", "ret
     return "generator_node"
 
 
-def route_after_critic(state: PharmaGraphState) -> Literal["generator_node", "END"]:
-    """Redraft only while critic issues remain and the retry budget is available."""
+def route_after_critic(
+    state: PharmaGraphState,
+) -> Literal["generator_node", "human_review_node"]:
+    """Redraft on critic issues; send the completed best draft to human review."""
     if state.get("critic_passed") or state.get("critic_unresolved"):
-        return "END"
+        return "human_review_node"
     return "generator_node"
 
 
@@ -337,6 +401,9 @@ workflow.add_node("web_fallback_node", web_fallback_node)
 workflow.add_node("safety_audit_node", safety_audit_node)
 workflow.add_node("generator_node", generator_node)
 workflow.add_node("critic_node", critic_node)
+workflow.add_node("human_review_node", human_review_node)
+workflow.add_node("finalize_node", finalize_node)
+workflow.add_node("refine_node", refine_node)
 
 workflow.add_edge(START, "normalize_node")
 workflow.add_conditional_edges(
@@ -373,13 +440,19 @@ workflow.add_edge("generator_node", "critic_node")
 workflow.add_conditional_edges(
     "critic_node",
     route_after_critic,
-    {"generator_node": "generator_node", "END": END},
+    {"generator_node": "generator_node", "human_review_node": "human_review_node"},
 )
+workflow.add_conditional_edges(
+    "human_review_node",
+    route_after_human_review,
+    {"finalize_node": "finalize_node", "refine_node": "refine_node"},
+)
+workflow.add_edge("finalize_node", END)
+workflow.add_edge("refine_node", END)
 
 memory = MemorySaver()
 compiled_pharma_graph = workflow.compile(
     checkpointer=memory,
-    interrupt_before=["generator_node"],
 )
 
 print("[Graph Setup] LangGraph Workflow Compiled Successfully with persistent MemorySaver.")

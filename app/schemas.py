@@ -120,3 +120,11 @@ class Brief(BaseModel):
     evidence_gaps: List[str] = Field(default_factory=list)
     sources: List[BriefSource] = Field(default_factory=list)
     disclaimer: str = NON_MEDICAL_ADVICE_DISCLAIMER
+
+
+class HumanReviewResponse(BaseModel):
+    """Validated response to a human review interrupt."""
+
+    decision: Literal["approve", "edit", "reject"]
+    feedback: str = ""
+    edited_brief: Optional[str] = None
