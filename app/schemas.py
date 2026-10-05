@@ -54,6 +54,13 @@ class GradeResult(BaseModel):
     missing_topics: List[str] = Field(default_factory=list)
 
 
+class QueryRewriteResult(BaseModel):
+    """An LLM-proposed search query based on evidence gaps."""
+
+    search_query: str = Field(min_length=1)
+    rationale: str = ""
+
+
 class SafetyFinding(BaseModel):
     """A deterministic safety finding linked to one or more evidence documents."""
 
