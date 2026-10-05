@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from app import graph
@@ -93,7 +94,9 @@ async def test_compiled_graph_runs_human_review_decisions(monkeypatch, decision)
             "audit_log": state.get("audit_log", []),
         }
 
-    monkeypatch.setitem(graph.workflow.nodes, "safety_audit_node", fake_safety_audit)
+    compiled_graph = graph.build_compiled_graph(
+        InMemorySaver(), node_overrides={"safety_audit_node": fake_safety_audit}
+    )
 
     initial_state = {
         "drug_query": "Compound-X",
@@ -109,12 +112,11 @@ async def test_compiled_graph_runs_human_review_decisions(monkeypatch, decision)
     config = {"configurable": {"thread_id": "test_run_1"}}
 
     config["configurable"]["thread_id"] = f"human-review-{decision}"
-    interrupted = await graph.compiled_pharma_graph.ainvoke(initial_state, config=config)
+    interrupted = await compiled_graph.ainvoke(initial_state, config=config)
 
     assert isinstance(interrupted, dict)
     assert interrupted["canonical_name"] == "metformin"
-    assert interrupted.get("__interrupted_at") == "human_review_node"
-    assert interrupted["__interrupt__"][0]["value"]["brief"] == "Mock regulatory brief."
+    assert interrupted["__interrupt__"][0].value["brief"] == "Mock regulatory brief."
     assert [document.source for document in interrupted["documents"]] == [
         "PubMed",
         "ClinicalTrials.gov",
@@ -127,7 +129,7 @@ async def test_compiled_graph_runs_human_review_decisions(monkeypatch, decision)
         "feedback": "Please revise the evidence summary." if decision != "approve" else "",
         "edited_brief": "Human-edited brief." if decision == "edit" else None,
     }
-    result = await graph.compiled_pharma_graph.ainvoke(Command(resume=response), config=config)
+    result = await compiled_graph.ainvoke(Command(resume=response), config=config)
 
     assert result["human_decision"] == decision
     if decision == "approve":

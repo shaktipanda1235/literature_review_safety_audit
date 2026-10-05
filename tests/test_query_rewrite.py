@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
 
 from app import graph
 from app.adapters.rxnorm import RxNormResolution
@@ -70,16 +71,17 @@ async def test_insufficient_evidence_rewrites_exactly_max_retries_then_falls_bac
 
     monkeypatch.setattr(graph, "RxNormClient", lambda: FakeRxNormClient())
     monkeypatch.setattr(graph, "get_llm", lambda role: rewriter)
-    monkeypatch.setitem(graph.workflow.nodes, "retrieve_node", retrieve)
-    monkeypatch.setitem(graph.workflow.nodes, "grade_node", grade)
-    monkeypatch.setitem(graph.workflow.nodes, "web_fallback_node", fallback)
-    monkeypatch.setitem(
-        graph.workflow.nodes,
-        "safety_audit_node",
-        lambda state: {
-            "safety_violations": [],
-            "safety_findings": [],
-            "risk_level": "unknown",
+    compiled_graph = graph.build_compiled_graph(
+        InMemorySaver(),
+        node_overrides={
+            "retrieve_node": retrieve,
+            "grade_node": grade,
+            "web_fallback_node": fallback,
+            "safety_audit_node": lambda state: {
+                "safety_violations": [],
+                "safety_findings": [],
+                "risk_level": "unknown",
+            },
         },
     )
 
@@ -93,7 +95,7 @@ async def test_insufficient_evidence_rewrites_exactly_max_retries_then_falls_bac
         "human_approved": False,
         "chat_history": [],
     }
-    result = await graph.compiled_pharma_graph.ainvoke(
+    result = await compiled_graph.ainvoke(
         initial_state,
         config={"configurable": {"thread_id": "query-retry-bound-test"}},
     )

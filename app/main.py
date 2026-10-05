@@ -1,7 +1,8 @@
 import asyncio
 
+from app.checkpointing import create_checkpointer
 from app.config import DEFAULT_DRUG_QUERY
-from app.graph import PharmaGraphState, compiled_pharma_graph
+from app.graph import PharmaGraphState, build_compiled_graph
 
 
 async def main():
@@ -20,7 +21,9 @@ async def main():
     config = {"configurable": {"thread_id": "pharma_demo_1"}}
 
     print("\nStarting workflow...")
-    result = await compiled_pharma_graph.ainvoke(initial_state, config=config)
+    async with create_checkpointer() as checkpointer:
+        compiled_pharma_graph = build_compiled_graph(checkpointer)
+        result = await compiled_pharma_graph.ainvoke(initial_state, config=config)
     print("\nFinal workflow result:")
     print(result)
 

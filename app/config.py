@@ -42,3 +42,8 @@ CACHE_TTL_SECONDS = 300  # 5 minutes
 
 # Rate limiting
 RATE_LIMIT_DELAY_SECONDS = 0.22  # Per-host rate limit delay
+CHECKPOINTER_BACKEND = os.getenv("CHECKPOINTER_BACKEND", "sqlite").strip().casefold()
+CHECKPOINT_SQLITE_PATH = os.getenv(
+	"CHECKPOINT_SQLITE_PATH", os.path.join(".cache", "checkpoints", "pharma.sqlite")
+)
+CHECKPOINT_POSTGRES_URL = os.getenv("CHECKPOINT_POSTGRES_URL") or os.getenv("DATABASE_URL")
