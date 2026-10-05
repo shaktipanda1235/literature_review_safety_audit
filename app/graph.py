@@ -12,11 +12,11 @@ from app.adapters.clinicaltrials import search_clinical_trials
 from app.adapters.openfda import search_openfda
 from app.adapters.openfda_faers import search_openfda_faers
 from app.adapters.rxnorm import RxNormClient
-from app.config import GRADE_PARSE_RETRIES, MIN_RELEVANT_DOCUMENTS
+from app.config import GRADE_PARSE_RETRIES, MAX_SEARCH_RETRIES, MIN_RELEVANT_DOCUMENTS
 from app.brief import draft_node
 from app.llm import get_llm, load_prompt
 from app.safety.subgraph import safety_audit_node
-from app.schemas import Brief, EvidenceItem, GradeResult, SafetyFinding
+from app.schemas import Brief, EvidenceItem, GradeResult, QueryRewriteResult, SafetyFinding
 from app.sources.base import HttpClient
 
 
@@ -34,6 +34,8 @@ class PharmaGraphState(TypedDict):
     canonical_name: NotRequired[str]
     synonyms: NotRequired[List[str]]
     normalization_error: NotRequired[str]
+    search_query: NotRequired[str]
+    search_attempts: NotRequired[int]
     documents: NotRequired[List[EvidenceItem]]
     audit_log: NotRequired[List[str]]
     grade_result: NotRequired[GradeResult]
@@ -64,6 +66,8 @@ async def normalize_node(state: PharmaGraphState) -> Dict:
         "canonical_name": resolution.canonical_name,
         "synonyms": resolution.synonyms,
         "normalization_error": "",
+        "search_query": resolution.canonical_name,
+        "search_attempts": state.get("search_attempts", 0),
     }
 
 
@@ -76,7 +80,7 @@ def route_after_normalization(
 
 async def retrieve_node(state: PharmaGraphState) -> Dict:
     """Retrieve evidence concurrently while recording individual source failures."""
-    query = state.get("canonical_name") or state["drug_query"]
+    query = state.get("search_query") or state.get("canonical_name") or state["drug_query"]
     client = HttpClient()
     source_names = ["PubMed", "ClinicalTrials.gov", "openFDA labels", "openFDA FAERS"]
     try:
@@ -240,14 +244,60 @@ def web_fallback_node(state: PharmaGraphState) -> Dict:
     return {"web_fallback_data": external_data}
 
 
+async def rewrite_node(state: PharmaGraphState) -> Dict:
+    """Rewrite the current query using missing topics and normalized synonyms."""
+    attempts = state.get("search_attempts", 0)
+    current_query = state.get("search_query") or state.get("canonical_name") or state["drug_query"]
+    if attempts >= MAX_SEARCH_RETRIES:
+        return {"search_query": current_query, "search_attempts": attempts}
+
+    grade_result = state.get("grade_result")
+    missing_topics = grade_result.missing_topics if grade_result else []
+    rewrite_input = {
+        "current_query": current_query,
+        "canonical_name": state.get("canonical_name") or state["drug_query"],
+        "synonyms": state.get("synonyms", []),
+        "missing_topics": missing_topics,
+    }
+    messages = [
+        SystemMessage(content=load_prompt("query_rewriter")),
+        HumanMessage(content=json.dumps(rewrite_input, ensure_ascii=False)),
+    ]
+    audit_log = list(state.get("audit_log") or [])
+
+    try:
+        rewriter = get_llm("rewriter").with_structured_output(QueryRewriteResult)
+        response = await rewriter.ainvoke(messages)
+        rewrite_result = QueryRewriteResult.model_validate(response)
+        rewritten_query = rewrite_result.search_query.strip()
+        if not rewritten_query:
+            raise ValueError("Rewriter returned an empty search query")
+    except Exception as error:
+        rewritten_query = current_query
+        audit_log.append(
+            f"Query rewrite attempt {attempts + 1} failed: {type(error).__name__}: {error}"
+        )
+
+    return {
+        "search_query": rewritten_query,
+        "search_attempts": attempts + 1,
+        "audit_log": audit_log,
+    }
+
+
 async def generator_node(state: PharmaGraphState) -> Dict:
     """Generate and validate the citation-enforced structured brief."""
     return await draft_node(state)
 
 
-def route_after_grading(state: PharmaGraphState) -> Literal["web_fallback_node", "safety_audit_node"]:
-    """Choose fallback or direct safety review based on data quality."""
+def route_after_grading(
+    state: PharmaGraphState,
+) -> Literal["rewrite_node", "web_fallback_node", "safety_audit_node"]:
+    """Retry insufficient retrieval with a rewritten query, then use fallback."""
     if state["grade_decision"] == "fallback":
+        if state.get("search_attempts", 0) < MAX_SEARCH_RETRIES:
+            print("  -> Evidence insufficient. Rewriting the search query...")
+            return "rewrite_node"
         print("  -> Routing to Web Fallback...")
         return "web_fallback_node"
 
@@ -265,6 +315,7 @@ workflow = StateGraph(PharmaGraphState)
 workflow.add_node("normalize_node", normalize_node)
 workflow.add_node("retrieve_node", retrieve_node)
 workflow.add_node("grade_node", grade_node)
+workflow.add_node("rewrite_node", rewrite_node)
 workflow.add_node("web_fallback_node", web_fallback_node)
 workflow.add_node("safety_audit_node", safety_audit_node)
 workflow.add_node("generator_node", generator_node)
@@ -276,11 +327,13 @@ workflow.add_conditional_edges(
     {"retrieve_node": "retrieve_node", "END": END},
 )
 workflow.add_edge("retrieve_node", "grade_node")
+workflow.add_edge("rewrite_node", "retrieve_node")
 
 workflow.add_conditional_edges(
     "grade_node",
     route_after_grading,
     {
+        "rewrite_node": "rewrite_node",
         "web_fallback_node": "web_fallback_node",
         "safety_audit_node": "safety_audit_node",
     },
