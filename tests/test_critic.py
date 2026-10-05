@@ -108,7 +108,7 @@ def test_critic_keeps_best_brief_and_marks_unresolved_at_redraft_bound():
     assert state["redraft_count"] == MAX_REDRAFTS
     assert state["critic_unresolved"] is True
     assert state["audit_log"] == ["Critic issues remain after the redraft limit was reached."]
-    assert route_after_critic(state) == "END"
+    assert route_after_critic(state) == "human_review_node"
 
 
 def test_critic_passes_when_critical_finding_is_cited_and_mentioned():

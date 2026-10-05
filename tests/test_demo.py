@@ -1,15 +1,17 @@
 import json
 
 import pytest
+from langgraph.types import Command
 
 from app import graph
 from app.adapters.rxnorm import RxNormResolution
-from app.schemas import EvidenceItem
+from app.schemas import Brief, CitedClaim, EvidenceItem
 
 
 @pytest.mark.asyncio
-async def test_compiled_graph_runs(monkeypatch):
-    """Run the async graph with mocked external services."""
+@pytest.mark.parametrize("decision", ["approve", "edit", "reject"])
+async def test_compiled_graph_runs_human_review_decisions(monkeypatch, decision):
+    """Run the graph to human review and resume each supported decision."""
 
     class FakeHttpClient:
         async def close(self):
@@ -66,6 +68,14 @@ async def test_compiled_graph_runs(monkeypatch):
     async def failed_faers(*args, **kwargs):
         raise RuntimeError("FAERS unavailable")
 
+    async def fake_draft(state):
+        doc_ids = [document.doc_id for document in state.get("documents", [])]
+        brief = Brief(
+            summary=CitedClaim(text="Evidence is limited to retrieved sources.", doc_ids=doc_ids),
+            evidence_level="moderate",
+        )
+        return {"brief": brief, "regulatory_brief": "Mock regulatory brief."}
+
     monkeypatch.setattr(graph, "HttpClient", FakeHttpClient)
     monkeypatch.setattr(graph, "RxNormClient", FakeRxNormClient)
     monkeypatch.setattr(graph, "get_llm", lambda role: FakeStructuredGrader())
@@ -73,6 +83,7 @@ async def test_compiled_graph_runs(monkeypatch):
     monkeypatch.setattr(graph, "search_clinical_trials", source_result("ClinicalTrials.gov"))
     monkeypatch.setattr(graph, "search_openfda", source_result("openFDA labels"))
     monkeypatch.setattr(graph, "search_openfda_faers", failed_faers)
+    monkeypatch.setattr(graph, "draft_node", fake_draft)
 
     async def fake_safety_audit(state):
         return {
@@ -97,15 +108,36 @@ async def test_compiled_graph_runs(monkeypatch):
 
     config = {"configurable": {"thread_id": "test_run_1"}}
 
-    result = await graph.compiled_pharma_graph.ainvoke(initial_state, config=config)
+    config["configurable"]["thread_id"] = f"human-review-{decision}"
+    interrupted = await graph.compiled_pharma_graph.ainvoke(initial_state, config=config)
 
-    assert isinstance(result, dict)
-    assert result["canonical_name"] == "metformin"
-    assert result.get("__interrupted_at") == "generator_node"
-    assert [document.source for document in result["documents"]] == [
+    assert isinstance(interrupted, dict)
+    assert interrupted["canonical_name"] == "metformin"
+    assert interrupted.get("__interrupted_at") == "human_review_node"
+    assert interrupted["__interrupt__"][0]["value"]["brief"] == "Mock regulatory brief."
+    assert [document.source for document in interrupted["documents"]] == [
         "PubMed",
         "ClinicalTrials.gov",
         "openFDA labels",
     ]
-    assert any("openFDA FAERS retrieval failed" in entry for entry in result["audit_log"])
+    assert any("openFDA FAERS retrieval failed" in entry for entry in interrupted["audit_log"])
+
+    response = {
+        "decision": decision,
+        "feedback": "Please revise the evidence summary." if decision != "approve" else "",
+        "edited_brief": "Human-edited brief." if decision == "edit" else None,
+    }
+    result = await graph.compiled_pharma_graph.ainvoke(Command(resume=response), config=config)
+
+    assert result["human_decision"] == decision
+    if decision == "approve":
+        assert result["human_approved"] is True
+        assert result["review_status"] == "approved"
+    elif decision == "edit":
+        assert result["human_approved"] is False
+        assert result["review_status"] == "needs_refinement"
+        assert result["edited_brief"] == "Human-edited brief."
+    else:
+        assert result["human_approved"] is False
+        assert result["review_status"] == "rejected"
 
