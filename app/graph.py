@@ -12,8 +12,14 @@ from app.adapters.clinicaltrials import search_clinical_trials
 from app.adapters.openfda import search_openfda
 from app.adapters.openfda_faers import search_openfda_faers
 from app.adapters.rxnorm import RxNormClient
-from app.config import GRADE_PARSE_RETRIES, MAX_SEARCH_RETRIES, MIN_RELEVANT_DOCUMENTS
+from app.config import (
+    GRADE_PARSE_RETRIES,
+    MAX_REDRAFTS,
+    MAX_SEARCH_RETRIES,
+    MIN_RELEVANT_DOCUMENTS,
+)
 from app.brief import draft_node
+from app.critic import critic_node
 from app.llm import get_llm, load_prompt
 from app.safety.subgraph import safety_audit_node
 from app.schemas import Brief, EvidenceItem, GradeResult, QueryRewriteResult, SafetyFinding
@@ -43,6 +49,10 @@ class PharmaGraphState(TypedDict):
     safety_findings: NotRequired[List[SafetyFinding]]
     risk_level: NotRequired[Literal["critical", "high", "moderate", "low", "unknown"]]
     brief: NotRequired[Brief]
+    critic_feedback: NotRequired[List[str]]
+    critic_passed: NotRequired[bool]
+    critic_unresolved: NotRequired[bool]
+    redraft_count: NotRequired[int]
 
 
 async def normalize_node(state: PharmaGraphState) -> Dict:
@@ -310,6 +320,13 @@ def route_after_audit(state: PharmaGraphState) -> Literal["generator_node", "ret
     return "generator_node"
 
 
+def route_after_critic(state: PharmaGraphState) -> Literal["generator_node", "END"]:
+    """Redraft only while critic issues remain and the retry budget is available."""
+    if state.get("critic_passed") or state.get("critic_unresolved"):
+        return "END"
+    return "generator_node"
+
+
 workflow = StateGraph(PharmaGraphState)
 
 workflow.add_node("normalize_node", normalize_node)
@@ -319,6 +336,7 @@ workflow.add_node("rewrite_node", rewrite_node)
 workflow.add_node("web_fallback_node", web_fallback_node)
 workflow.add_node("safety_audit_node", safety_audit_node)
 workflow.add_node("generator_node", generator_node)
+workflow.add_node("critic_node", critic_node)
 
 workflow.add_edge(START, "normalize_node")
 workflow.add_conditional_edges(
@@ -351,7 +369,12 @@ workflow.add_conditional_edges(
     },
 )
 
-workflow.add_edge("generator_node", END)
+workflow.add_edge("generator_node", "critic_node")
+workflow.add_conditional_edges(
+    "critic_node",
+    route_after_critic,
+    {"generator_node": "generator_node", "END": END},
+)
 
 memory = MemorySaver()
 compiled_pharma_graph = workflow.compile(
