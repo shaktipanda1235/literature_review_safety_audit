@@ -223,6 +223,8 @@ def _brief_context(
         "safety_findings": [
             finding.model_dump() for finding in state.get("safety_findings", [])
         ],
+        "critic_feedback": state.get("critic_feedback", []),
+        "redraft_count": state.get("redraft_count", 0),
         "evidence_gaps": _evidence_gaps(state, state.get("safety_findings", [])),
         "required_disclaimer": NON_MEDICAL_ADVICE_DISCLAIMER,
     }
