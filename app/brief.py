@@ -12,16 +12,75 @@ from app.schemas import (
     BriefSource,
     CitedClaim,
     EvidenceItem,
+    GradeResult,
     SafetyFinding,
 )
+from app.config import MIN_RELEVANT_DOCUMENTS
 
 
 MAX_BRIEF_REGENERATION_ATTEMPTS = 1
 SAFETY_SEVERITY_ORDER = ("critical", "high", "moderate", "info", "no_evidence")
+INSUFFICIENT_EVIDENCE_HEADLINE = "Insufficient evidence to assess safety."
 
 
 class BriefValidationError(ValueError):
     """Raised when generated claims fail citation or content validation."""
+
+
+def compute_evidence_level(
+    documents: Iterable[EvidenceItem], grade: GradeResult | None
+) -> Literal["none", "weak", "moderate", "strong"]:
+    """Combine graded relevance with evidence volume, source diversity, trials, and labels."""
+    evidence = list(documents)
+    if not evidence:
+        return "none"
+
+    relevance = grade.document_relevance if grade else []
+    relevant_count = sum(item.relevance == "relevant" for item in relevance)
+    if relevant_count < MIN_RELEVANT_DOCUMENTS:
+        return "weak"
+
+    score = 0
+    if len(evidence) >= 3:
+        score += 1
+    if len(evidence) >= 8:
+        score += 1
+
+    source_count = len({item.source.casefold() for item in evidence if item.source})
+    if source_count >= 2:
+        score += 1
+    if source_count >= 3:
+        score += 1
+
+    has_trial_phase = any(
+        item.source.casefold() == "clinicaltrials.gov"
+        and any(
+            str(phase).strip().casefold() not in {"", "na", "n/a", "unknown"}
+            for phase in (
+                item.raw_payload.get("phase")
+                if isinstance(item.raw_payload.get("phase"), list)
+                else [item.raw_payload.get("phase")]
+            )
+        )
+        for item in evidence
+    )
+    has_label = any(
+        isinstance(item.raw_payload.get("section"), str)
+        and bool(item.raw_payload["section"].strip())
+        for item in evidence
+    )
+    score += int(has_trial_phase) + int(has_label)
+
+    if grade and grade.evidence_level == "moderate":
+        score += 1
+    elif grade and grade.evidence_level == "strong":
+        score += 2
+
+    if score >= 5:
+        return "strong"
+    if score >= 2:
+        return "moderate"
+    return "weak"
 
 
 def _claims_in_brief(brief: Brief) -> Iterable[tuple[str, CitedClaim]]:
@@ -150,11 +209,15 @@ def _evidence_gaps(state: Mapping, safety_findings: list[SafetyFinding]) -> list
     return list(dict.fromkeys(gap for gap in gaps if gap))
 
 
-def _brief_context(state: Mapping, documents: list[EvidenceItem]) -> dict:
+def _brief_context(
+    state: Mapping,
+    documents: list[EvidenceItem],
+    evidence_level: Literal["none", "weak", "moderate", "strong"],
+) -> dict:
     grade_result = state.get("grade_result")
     return {
         "drug": state.get("canonical_name") or state.get("drug_query", "Unknown"),
-        "evidence_level": state.get("evidence_level", "none"),
+        "evidence_level": evidence_level,
         "documents": _claims_payload(documents),
         "grade_result": grade_result.model_dump() if grade_result else None,
         "safety_findings": [
@@ -169,7 +232,8 @@ async def draft_node(state: Mapping, *, model=None) -> dict:
     """Create a citation-validated Brief and regenerate once when validation fails."""
     documents = list(state.get("documents") or [])
     known_doc_ids = {item.doc_id for item in documents}
-    context = _brief_context(state, documents)
+    evidence_level = compute_evidence_level(documents, state.get("grade_result"))
+    context = _brief_context(state, documents, evidence_level)
 
     if not documents:
         brief = Brief(
@@ -196,7 +260,7 @@ async def draft_node(state: Mapping, *, model=None) -> dict:
             brief = Brief.model_validate(response)
             brief = brief.model_copy(
                 update={
-                    "evidence_level": state.get("evidence_level", brief.evidence_level),
+                    "evidence_level": evidence_level,
                     "evidence_gaps": list(
                         dict.fromkeys(brief.evidence_gaps + context["evidence_gaps"])
                     ),
@@ -204,6 +268,15 @@ async def draft_node(state: Mapping, *, model=None) -> dict:
                     "disclaimer": NON_MEDICAL_ADVICE_DISCLAIMER,
                 }
             )
+            if evidence_level in {"none", "weak"}:
+                brief = brief.model_copy(
+                    update={
+                        "summary": CitedClaim(
+                            text=INSUFFICIENT_EVIDENCE_HEADLINE,
+                            doc_ids=sorted(known_doc_ids),
+                        )
+                    }
+                )
             validate_brief(brief, known_doc_ids)
             return {"brief": brief, "regulatory_brief": render_brief_markdown(brief)}
         except Exception as error:
