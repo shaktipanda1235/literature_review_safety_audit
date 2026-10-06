@@ -14,5 +14,6 @@ pydantic>=2.7.4
 PyYAML>=6.0.2
 fastapi>=0.115
 uvicorn>=0.30
+streamlit>=1.40
 langgraph-checkpoint-sqlite>=3.1.1
 langgraph-checkpoint-postgres>=3.1.2
