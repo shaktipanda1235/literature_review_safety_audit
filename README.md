@@ -20,6 +20,14 @@ python -m uvicorn app.api:app --reload
 
 The interactive API schema is available at `http://127.0.0.1:8000/docs`.
 
+Run the review UI in a second terminal:
+
+```bash
+python -m streamlit run ui/review_app.py
+```
+
+The UI connects to `http://127.0.0.1:8000` by default. Start the API first.
+
 Run tests:
 
 ```bash
