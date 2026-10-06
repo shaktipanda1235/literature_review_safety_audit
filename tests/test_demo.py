@@ -131,14 +131,20 @@ async def test_compiled_graph_runs_human_review_decisions(monkeypatch, decision)
     }
     result = await compiled_graph.ainvoke(Command(resume=response), config=config)
 
-    assert result["human_decision"] == decision
+    if decision == "edit":
+        assert result["__interrupt__"][0].value["human_round"] == 2
+        result = await compiled_graph.ainvoke(
+            Command(resume={"decision": "approve"}), config=config
+        )
+
+    assert result["human_decision"] == ("approve" if decision == "edit" else decision)
     if decision == "approve":
         assert result["human_approved"] is True
         assert result["review_status"] == "approved"
     elif decision == "edit":
-        assert result["human_approved"] is False
-        assert result["review_status"] == "needs_refinement"
-        assert result["edited_brief"] == "Human-edited brief."
+        assert result["human_approved"] is True
+        assert result["review_status"] == "approved"
+        assert result["edited_brief"] == ""
     else:
         assert result["human_approved"] is False
         assert result["review_status"] == "rejected"
