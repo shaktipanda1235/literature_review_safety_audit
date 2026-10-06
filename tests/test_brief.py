@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from app.brief import (
@@ -22,6 +24,7 @@ class ScriptedStructuredModel:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = 0
+        self.message_batches = []
 
     def with_structured_output(self, schema):
         self.schema = schema
@@ -29,6 +32,7 @@ class ScriptedStructuredModel:
 
     async def ainvoke(self, messages):
         self.calls += 1
+        self.message_batches.append(messages)
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -211,6 +215,32 @@ async def test_draft_node_without_documents_returns_explicit_evidence_gap():
     assert "## Evidence Gaps" in result["regulatory_brief"]
     assert INSUFFICIENT_EVIDENCE_HEADLINE in result["regulatory_brief"]
     assert "not medical advice" in result["regulatory_brief"]
+
+
+@pytest.mark.asyncio
+async def test_draft_prompt_includes_human_feedback_and_edited_brief():
+    document = source_document()
+    model = ScriptedStructuredModel([brief_data(document.doc_id)])
+
+    await draft_node(
+        {
+            "drug_query": "ketoconazole",
+            "documents": [document],
+            "grade_result": None,
+            "safety_findings": [],
+            "human_feedback": "Clarify the hepatic warning.",
+            "edited_brief": "Please distinguish warnings from observed incidence.",
+            "human_rounds": 1,
+        },
+        model=model,
+    )
+
+    prompt_payload = json.loads(model.message_batches[0][-1].content)
+    assert prompt_payload["human_feedback"] == "Clarify the hepatic warning."
+    assert prompt_payload["edited_brief"] == (
+        "Please distinguish warnings from observed incidence."
+    )
+    assert prompt_payload["human_rounds"] == 1
 
 
 @pytest.mark.asyncio

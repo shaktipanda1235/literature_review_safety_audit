@@ -14,6 +14,7 @@ from app.adapters.openfda_faers import search_openfda_faers
 from app.adapters.rxnorm import RxNormClient
 from app.config import (
     GRADE_PARSE_RETRIES,
+    MAX_HUMAN_ROUNDS,
     MAX_REDRAFTS,
     MAX_SEARCH_RETRIES,
     MIN_RELEVANT_DOCUMENTS,
@@ -63,7 +64,10 @@ class PharmaGraphState(TypedDict):
     human_decision: NotRequired[Literal["approve", "edit", "reject"]]
     human_feedback: NotRequired[str]
     edited_brief: NotRequired[str]
-    review_status: NotRequired[Literal["pending", "approved", "needs_refinement", "rejected"]]
+    human_rounds: NotRequired[int]
+    review_status: NotRequired[
+        Literal["pending", "refining", "approved", "needs_manual_review", "rejected"]
+    ]
 
 
 async def normalize_node(state: PharmaGraphState) -> Dict:
@@ -324,6 +328,8 @@ def human_review_node(state: PharmaGraphState) -> Dict:
             "risk_level": state.get("risk_level", "unknown"),
             "critic_unresolved": state.get("critic_unresolved", False),
             "critic_feedback": state.get("critic_feedback", []),
+            "human_round": state.get("human_rounds", 0) + 1,
+            "max_human_rounds": MAX_HUMAN_ROUNDS,
         }
     )
     review = HumanReviewResponse.model_validate(response)
@@ -332,11 +338,11 @@ def human_review_node(state: PharmaGraphState) -> Dict:
     updates = {
         "human_decision": review.decision,
         "human_feedback": review.feedback,
+        "human_rounds": state.get("human_rounds", 0) + 1,
         "review_status": "pending",
         "audit_log": audit_log,
+        "edited_brief": review.edited_brief or "",
     }
-    if review.edited_brief is not None:
-        updates["edited_brief"] = review.edited_brief
     return updates
 
 
@@ -356,9 +362,27 @@ def finalize_node(state: PharmaGraphState) -> Dict:
 
 
 def refine_node(state: PharmaGraphState) -> Dict:
-    """Record a handoff for the bounded refinement workflow implemented in S4.6."""
-    status = "rejected" if state.get("human_decision") == "reject" else "needs_refinement"
-    return {"human_approved": False, "review_status": status}
+    """Apply review feedback to another draft unless the review is terminal or bounded."""
+    if state.get("human_decision") == "reject":
+        return {"human_approved": False, "review_status": "rejected"}
+
+    if state.get("human_rounds", 0) >= MAX_HUMAN_ROUNDS:
+        audit_log = list(state.get("audit_log") or [])
+        audit_log.append("Human review round limit reached; manual review is required.")
+        return {
+            "human_approved": False,
+            "review_status": "needs_manual_review",
+            "audit_log": audit_log,
+        }
+
+    return {"human_approved": False, "review_status": "refining"}
+
+
+def route_after_refine(state: PharmaGraphState) -> Literal["generator_node", "END"]:
+    """Stop on rejection or exhausted human rounds; otherwise generate a revised draft."""
+    if state.get("review_status") in {"rejected", "needs_manual_review"}:
+        return "END"
+    return "generator_node"
 
 
 def route_after_grading(
@@ -445,5 +469,9 @@ def build_compiled_graph(checkpointer, node_overrides: Dict | None = None):
         {"finalize_node": "finalize_node", "refine_node": "refine_node"},
     )
     workflow.add_edge("finalize_node", END)
-    workflow.add_edge("refine_node", END)
+    workflow.add_conditional_edges(
+        "refine_node",
+        route_after_refine,
+        {"generator_node": "generator_node", "END": END},
+    )
     return workflow.compile(checkpointer=checkpointer)

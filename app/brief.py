@@ -225,6 +225,9 @@ def _brief_context(
         ],
         "critic_feedback": state.get("critic_feedback", []),
         "redraft_count": state.get("redraft_count", 0),
+        "human_feedback": state.get("human_feedback", ""),
+        "edited_brief": state.get("edited_brief", ""),
+        "human_rounds": state.get("human_rounds", 0),
         "evidence_gaps": _evidence_gaps(state, state.get("safety_findings", [])),
         "required_disclaimer": NON_MEDICAL_ADVICE_DISCLAIMER,
     }
