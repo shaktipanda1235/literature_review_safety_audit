@@ -26,16 +26,18 @@ def critical_finding():
 
 
 def compile_critic_loop():
-    workflow = StateGraph(dict)
+    workflow = StateGraph(graph.PharmaGraphState)
     workflow.add_node("draft", graph.generator_node)
     workflow.add_node("critic", critic_node)
+    workflow.add_node("human_review_node", lambda state: {})
     workflow.add_edge(START, "draft")
     workflow.add_edge("draft", "critic")
     workflow.add_conditional_edges(
         "critic",
         route_after_critic,
-        {"generator_node": "draft", "END": END},
+        {"generator_node": "draft", "human_review_node": "human_review_node"},
     )
+    workflow.add_edge("human_review_node", END)
     return workflow.compile()
 
 

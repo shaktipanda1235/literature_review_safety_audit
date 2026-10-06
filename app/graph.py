@@ -4,7 +4,6 @@ from collections import Counter
 from typing import Dict, List, Literal, NotRequired, TypedDict
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
@@ -391,68 +390,60 @@ def route_after_critic(
     return "generator_node"
 
 
-workflow = StateGraph(PharmaGraphState)
+def build_compiled_graph(checkpointer, node_overrides: Dict | None = None):
+    """Build a fresh graph using the supplied official LangGraph checkpointer."""
+    workflow = StateGraph(PharmaGraphState)
+    nodes = {
+        "normalize_node": normalize_node,
+        "retrieve_node": retrieve_node,
+        "grade_node": grade_node,
+        "rewrite_node": rewrite_node,
+        "web_fallback_node": web_fallback_node,
+        "safety_audit_node": safety_audit_node,
+        "generator_node": generator_node,
+        "critic_node": critic_node,
+        "human_review_node": human_review_node,
+        "finalize_node": finalize_node,
+        "refine_node": refine_node,
+    }
+    nodes.update(node_overrides or {})
+    for node_name, node in nodes.items():
+        workflow.add_node(node_name, node)
 
-workflow.add_node("normalize_node", normalize_node)
-workflow.add_node("retrieve_node", retrieve_node)
-workflow.add_node("grade_node", grade_node)
-workflow.add_node("rewrite_node", rewrite_node)
-workflow.add_node("web_fallback_node", web_fallback_node)
-workflow.add_node("safety_audit_node", safety_audit_node)
-workflow.add_node("generator_node", generator_node)
-workflow.add_node("critic_node", critic_node)
-workflow.add_node("human_review_node", human_review_node)
-workflow.add_node("finalize_node", finalize_node)
-workflow.add_node("refine_node", refine_node)
-
-workflow.add_edge(START, "normalize_node")
-workflow.add_conditional_edges(
-    "normalize_node",
-    route_after_normalization,
-    {"retrieve_node": "retrieve_node", "END": END},
-)
-workflow.add_edge("retrieve_node", "grade_node")
-workflow.add_edge("rewrite_node", "retrieve_node")
-
-workflow.add_conditional_edges(
-    "grade_node",
-    route_after_grading,
-    {
-        "rewrite_node": "rewrite_node",
-        "web_fallback_node": "web_fallback_node",
-        "safety_audit_node": "safety_audit_node",
-    },
-)
-
-workflow.add_edge("web_fallback_node", "safety_audit_node")
-
-workflow.add_conditional_edges(
-    "safety_audit_node",
-    route_after_audit,
-    {
-        "generator_node": "generator_node",
-        "retrieve_node": "retrieve_node",
-        "END": END,
-    },
-)
-
-workflow.add_edge("generator_node", "critic_node")
-workflow.add_conditional_edges(
-    "critic_node",
-    route_after_critic,
-    {"generator_node": "generator_node", "human_review_node": "human_review_node"},
-)
-workflow.add_conditional_edges(
-    "human_review_node",
-    route_after_human_review,
-    {"finalize_node": "finalize_node", "refine_node": "refine_node"},
-)
-workflow.add_edge("finalize_node", END)
-workflow.add_edge("refine_node", END)
-
-memory = MemorySaver()
-compiled_pharma_graph = workflow.compile(
-    checkpointer=memory,
-)
-
-print("[Graph Setup] LangGraph Workflow Compiled Successfully with persistent MemorySaver.")
+    workflow.add_edge(START, "normalize_node")
+    workflow.add_conditional_edges(
+        "normalize_node",
+        route_after_normalization,
+        {"retrieve_node": "retrieve_node", "END": END},
+    )
+    workflow.add_edge("retrieve_node", "grade_node")
+    workflow.add_edge("rewrite_node", "retrieve_node")
+    workflow.add_conditional_edges(
+        "grade_node",
+        route_after_grading,
+        {
+            "rewrite_node": "rewrite_node",
+            "web_fallback_node": "web_fallback_node",
+            "safety_audit_node": "safety_audit_node",
+        },
+    )
+    workflow.add_edge("web_fallback_node", "safety_audit_node")
+    workflow.add_conditional_edges(
+        "safety_audit_node",
+        route_after_audit,
+        {"generator_node": "generator_node", "retrieve_node": "retrieve_node", "END": END},
+    )
+    workflow.add_edge("generator_node", "critic_node")
+    workflow.add_conditional_edges(
+        "critic_node",
+        route_after_critic,
+        {"generator_node": "generator_node", "human_review_node": "human_review_node"},
+    )
+    workflow.add_conditional_edges(
+        "human_review_node",
+        route_after_human_review,
+        {"finalize_node": "finalize_node", "refine_node": "refine_node"},
+    )
+    workflow.add_edge("finalize_node", END)
+    workflow.add_edge("refine_node", END)
+    return workflow.compile(checkpointer=checkpointer)
